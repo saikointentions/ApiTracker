@@ -1,51 +1,113 @@
-name: Run VRChat API Tracker
+const API = 'https://api.vrchat.cloud/api/1';
+const UA = 'kushCOOKIES-widget/1.0 (contact: YOUR_EMAIL_HERE)'; // VRChat requires a real User-Agent
+const CACHE_MS = 120000; // reuse the last result for 2 minutes so visitors don't hammer VRChat
 
-on:
-  schedule:
-    - cron: '*/15 * * * *'   # every 15 min; GitHub may delay it a few minutes
-  workflow_dispatch:
+const HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Content-Type': 'application/json',
+  'Cache-Control': 'public, max-age=60',
+};
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+let memo = { t: 0, data: null }; // in-memory cache, survives between requests
 
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
+// ---------- TOTP (RFC 6238) ----------
+function b32(s) {
+  const a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const c of s.replace(/[\s=]/g, '').toUpperCase()) bits += a.indexOf(c).toString(2).padStart(5, '0');
+  const out = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) out.push(parseInt(bits.slice(i, i + 8), 2));
+  return new Uint8Array(out);
+}
+async function totp(secret) {
+  const counter = new ArrayBuffer(8);
+  new DataView(counter).setBigUint64(0, BigInt(Math.floor(Date.now() / 30000)));
+  const key = await crypto.subtle.importKey('raw', b32(secret), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const h = new Uint8Array(await crypto.subtle.sign('HMAC', key, counter));
+  const o = h[h.length - 1] & 15;
+  const n = (((h[o] & 0x7f) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 1000000;
+  return String(n).padStart(6, '0');
+}
 
-jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+// ---------- Cookie jar ----------
+const cookieStr = jar => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+function absorb(res, jar) {
+  for (const sc of res.headers.getSetCookie()) {
+    const [pair] = sc.split(';');
+    const i = pair.indexOf('=');
+    const k = pair.slice(0, i).trim(), v = pair.slice(i + 1);
+    if (v) jar[k] = v; else delete jar[k];
+  }
+}
+async function vrc(path, jar, init = {}) {
+  const res = await fetch(API + path, {
+    ...init,
+    headers: { 'User-Agent': UA, Cookie: cookieStr(jar), ...(init.headers || {}) },
+  });
+  absorb(res, jar);
+  return res;
+}
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+// ---------- Login (only when the saved session is missing/expired) ----------
+async function login(env, jar) {
+  for (const k of Object.keys(jar)) delete jar[k];
+  const basic = btoa(`${encodeURIComponent(env.VRCHAT_USERNAME)}:${encodeURIComponent(env.VRCHAT_PASSWORD)}`);
 
-      # Saved session: restores the newest one, saves a fresh copy after the run
-      - name: Restore VRChat session
-        uses: actions/cache@v4
-        with:
-          path: .vrc-session
-          key: vrc-session-${{ github.run_id }}
-          restore-keys: vrc-session-
+  let res = await vrc('/auth/user', jar, { headers: { Authorization: `Basic ${basic}` } });
+  const body = await res.json();
+  if (!res.ok) throw new Error(`login failed ${res.status}`);
 
-      - name: Fetch VRChat group data
-        run: node scripts/fetch-vrc.mjs
-        env:
-          VRCHAT_USERNAME: ${{ vars.VRCHAT_USERNAME }}
-          VRCHAT_PASSWORD: ${{ secrets.VRCHAT_PASSWORD }}
-          VRCHAT_KEY: ${{ secrets.VRCHAT_KEY }}
-          VRCHAT_GROUP_ID: ${{ vars.VRCHAT_GROUP_ID }}
+  if (body.requiresTwoFactorAuth) {
+    if (!body.requiresTwoFactorAuth.includes('totp'))
+      throw new Error('account must use an authenticator app (TOTP) for 2FA');
+    res = await vrc('/auth/twofactorauth/totp/verify', jar, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: await totp(env.VRCHAT_TOTP_SECRET) }),
+    });
+    const v = await res.json();
+    if (!res.ok || !v.verified) throw new Error('2FA verification failed');
+  }
+  await env.VRC_KV.put('session', JSON.stringify(jar)); // saved, so we don't log in next time
+}
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-      - id: deployment
-        uses: actions/deploy-pages@v4
+// ---------- Stats ----------
+async function fetchStats(env) {
+  const jar = JSON.parse((await env.VRC_KV.get('session')) || '{}');
+  const gid = env.GROUP_ID;
+
+  let g = jar.auth ? await vrc(`/groups/${gid}`, jar) : null;
+  if (!g || g.status === 401) {
+    await login(env, jar);
+    g = await vrc(`/groups/${gid}`, jar);
+  }
+  if (!g.ok) throw new Error(`group fetch failed ${g.status}`);
+  const group = await g.json();
+
+  const i = await vrc(`/groups/${gid}/instances`, jar);
+  const inst = i.ok ? await i.json() : [];
+
+  return {
+    members: group.memberCount ?? 0,
+    onlineMembers: group.onlineMemberCount ?? 0,
+    instanceCount: Array.isArray(inst) ? inst.length : 0,
+  };
+}
+
+export default {
+  async fetch(req, env) {
+    if (req.method === 'OPTIONS') return new Response(null, { headers: HEADERS });
+
+    const now = Date.now();
+    if (memo.data && now - memo.t < CACHE_MS)
+      return new Response(JSON.stringify(memo.data), { headers: HEADERS });
+
+    try {
+      memo = { t: now, data: await fetchStats(env) };
+      return new Response(JSON.stringify(memo.data), { headers: HEADERS });
+    } catch (e) {
+      if (memo.data) return new Response(JSON.stringify(memo.data), { headers: HEADERS }); // last good numbers
+      return new Response(JSON.stringify({ error: String(e.message) }), { status: 502, headers: HEADERS });
+    }
+  },
+};
