@@ -1,5 +1,5 @@
 const API = 'https://api.vrchat.cloud/api/1';
-const UA = 'kushCOOKIES-widget/1.0 (contact: YOUR_EMAIL_HERE)'; // VRChat requires a real User-Agent
+const UA = 'kushCOOKIES-widget/1.0 (contact: jaystar25@aol.com)'; // VRChat requires a real User-Agent
 const CACHE_MS = 120000; // reuse the last result for 2 minutes so visitors don't hammer VRChat
 
 const HEADERS = {
