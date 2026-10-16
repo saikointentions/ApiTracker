@@ -1,14 +1,17 @@
 const API = 'https://api.vrchat.cloud/api/1';
-const UA = 'kushCOOKIES-widget/1.0 (contact: jaystar25@aol.com)'; // VRChat requires a real User-Agent
-const CACHE_MS = 120000; // reuse the last result for 2 minutes so visitors don't hammer VRChat
+const UA = 'kushCOOKIES-widget/1.0 (contact: jaystar25@aol.com)';
+const CACHE_MS = 120000;     // reuse the last good result for 2 minutes
+const COOLDOWN_MS = 300000;  // after a failure, wait 5 minutes before trying to log in again
 
 const HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Content-Type': 'application/json',
   'Cache-Control': 'public, max-age=60',
 };
+const NO_CACHE = { ...HEADERS, 'Cache-Control': 'no-store' };
 
-let memo = { t: 0, data: null }; // in-memory cache, survives between requests
+let memo = { t: 0, data: null };
+let fail = { t: 0, msg: '' };
 
 // ---------- TOTP (RFC 6238) ----------
 function b32(s) {
@@ -55,7 +58,7 @@ async function login(env, jar) {
 
   let res = await vrc('/auth/user', jar, { headers: { Authorization: `Basic ${basic}` } });
   const body = await res.json();
-  if (!res.ok) throw new Error(`login failed ${res.status}`);
+  if (!res.ok) throw new Error(`login failed ${res.status} (check VRCHAT_USERNAME / VRCHAT_PASSWORD)`);
 
   if (body.requiresTwoFactorAuth) {
     if (!body.requiresTwoFactorAuth.includes('totp'))
@@ -66,13 +69,17 @@ async function login(env, jar) {
       body: JSON.stringify({ code: await totp(env.VRCHAT_TOTP_SECRET) }),
     });
     const v = await res.json();
-    if (!res.ok || !v.verified) throw new Error('2FA verification failed');
+    if (!res.ok || !v.verified) throw new Error(`2FA verification failed (${res.status}) - the TOTP secret is probably wrong`);
   }
-  await env.VRC_KV.put('session', JSON.stringify(jar)); // saved, so we don't log in next time
+  await env.VRC_KV.put('session', JSON.stringify(jar));
 }
 
 // ---------- Stats ----------
 async function fetchStats(env) {
+  for (const k of ['VRCHAT_USERNAME', 'VRCHAT_PASSWORD', 'VRCHAT_TOTP_SECRET', 'GROUP_ID'])
+    if (!env[k]) throw new Error(`missing variable ${k}`);
+  if (!env.VRC_KV) throw new Error('missing KV binding VRC_KV');
+
   const jar = JSON.parse((await env.VRC_KV.get('session')) || '{}');
   const gid = env.GROUP_ID;
 
@@ -81,7 +88,7 @@ async function fetchStats(env) {
     await login(env, jar);
     g = await vrc(`/groups/${gid}`, jar);
   }
-  if (!g.ok) throw new Error(`group fetch failed ${g.status}`);
+  if (!g.ok) throw new Error(`group fetch failed ${g.status} (check GROUP_ID starts with grp_ and the account is in the group)`);
   const group = await g.json();
 
   const i = await vrc(`/groups/${gid}/instances`, jar);
@@ -98,16 +105,35 @@ export default {
   async fetch(req, env) {
     if (req.method === 'OPTIONS') return new Response(null, { headers: HEADERS });
 
+    // Private test: compare this code with your authenticator app. Remove DEBUG_KEY when done.
+    const url = new URL(req.url);
+    if (env.DEBUG_KEY && url.searchParams.get('codecheck') === env.DEBUG_KEY) {
+      const s = env.VRCHAT_TOTP_SECRET || '';
+      return new Response(JSON.stringify({
+        codeNow: s ? await totp(s) : null,
+        secretLength: s.replace(/[\s=]/g, '').length,
+        badCharacters: (s.match(/[^A-Za-z2-7\s=]/g) || []).length,
+      }), { headers: NO_CACHE });
+    }
+
     const now = Date.now();
+
+    if (fail.msg && now - fail.t < COOLDOWN_MS) {
+      if (memo.data) return new Response(JSON.stringify(memo.data), { headers: HEADERS });
+      return new Response(JSON.stringify({ error: fail.msg, retryInSeconds: Math.ceil((COOLDOWN_MS - (now - fail.t)) / 1000) }), { status: 502, headers: NO_CACHE });
+    }
+
     if (memo.data && now - memo.t < CACHE_MS)
       return new Response(JSON.stringify(memo.data), { headers: HEADERS });
 
     try {
       memo = { t: now, data: await fetchStats(env) };
+      fail = { t: 0, msg: '' };
       return new Response(JSON.stringify(memo.data), { headers: HEADERS });
     } catch (e) {
-      if (memo.data) return new Response(JSON.stringify(memo.data), { headers: HEADERS }); // last good numbers
-      return new Response(JSON.stringify({ error: String(e.message) }), { status: 502, headers: HEADERS });
+      fail = { t: now, msg: String(e.message) };
+      if (memo.data) return new Response(JSON.stringify(memo.data), { headers: HEADERS });
+      return new Response(JSON.stringify({ error: fail.msg }), { status: 502, headers: NO_CACHE });
     }
   },
 };
